@@ -1,38 +1,84 @@
 # StockAnalyzer — Early-Stage Momentum Stock Screener
 
-A two-phase pipeline that identifies **early-stage** momentum stocks before they become obvious.
+A multi-phase pipeline that identifies **early-stage** momentum stocks before they become obvious.
 
-Phase 1 uses **real market data** (yfinance) for quantitative screening; Phase 2 uses an **LLM with web search** (OpenAI) for qualitative catalyst/narrative analysis.
+Phase 1 uses **real market data** (yfinance) for quantitative screening; Phase 2 uses a **two-step LLM process** (OpenAI GPT-4o with web search) for qualitative catalyst/narrative analysis; Phase 2.75 uses a **reasoning model** (o3-mini) for institutional-grade validation; a **Devil's Advocate** LLM independently challenges every approved pick.
 
 ## Architecture
 
 ```
-Phase 1: Quantitative Screening          Phase 2: Qualitative Analysis        Phase 3: Output
-┌───────────────┐                        ┌──────────────────────┐             ┌──────────────┐
-│ UniverseLoader │→ MarketDataFetcher →  │ LLMAnalyzer          │→ Validator →│ ReportExporter│
-│ (yf screener)  │  TechnicalCalculator  │ (GPT-4o + web search)│             │ (CSV/XLSX/log)│
-│                │→ QuantitativeFilter → │ (batched, 4 at a time│             │              │
-└───────────────┘   (~20-50 candidates)  └──────────────────────┘             └──────────────┘
+Phase 1: Quantitative       Phase 1.5: Intel     Phase 2: LLM Analysis       Phase 2.75              Phase 2.5          Phase 3: Output
+┌─────────────────┐         ┌────────────┐       ┌────────────────────┐      ┌──────────────────┐    ┌──────────────┐    ┌──────────────┐
+│ UniverseLoader   │         │ NewsFetcher │       │ Step 1: Web Search │      │ Institutional    │    │ Devil's      │    │ Validator    │
+│(triple-query scan│         │ (yf news)   │       │ (unstructured)     │      │ Validator        │    │ Advocate     │    │ (quant + DA) │
+│        ↓         │         │      ↓      │       │          ↓         │      │ (o3-mini + web)  │    │ (web search) │    │      ↓       │
+│ MarketDataFetcher│         │ Market      │  ──→  │ Step 2: Structured │ ──→  │ "Is this truly   │──→ │ independent  │──→ │ Forward      │
+│        ↓         │   ──→   │ Regime      │       │ Analysis (Pydantic)│      │  early-stage?"   │    │ challenge    │    │ Tracker      │
+│ TechnicalCalc    │         │ (SPY-based) │       └────────────────────┘      └──────────────────┘    └──────────────┘    │      ↓       │
+│        ↓         │         └────────────┘                                                                                │ Report       │
+│ QuantFilter      │                                                                                                       │ Exporter     │
+│ (~20-40 stocks)  │                                                                                                       └──────────────┘
+└─────────────────┘
 ```
 
-### Phase 1 — what code computes (no LLM)
+### Phase 1 — Quantitative (pure Python, no LLM)
+- Exhaustive triple-query universe scan: all matching US equities ($500M-$25B market cap)
 - 50/200-day moving averages, trend structure
-- Relative volume (current vs 20-day avg)
-- Breakout detection (price crossed N-day high in last 5 sessions)
-- Distance from 52-week high, distance from breakout
-- Hard filters: market cap $500M–$25B, dollar volume > $10M, within 8% of 52wk high, relative vol > 1.5x
+- Multi-timeframe breakout detection (20/60/120-day highs)
+- Volume confirmation on breakout day
+- ATR contraction (base tightness before breakout)
+- Sector-relative strength (must outperform own sector)
+- Hard filters: market cap $500M-$25B, within 15% of 52wk high, relative vol > 1.5x
 
-### Phase 2 — what the LLM judges (with web search)
-- Is there a **specific, recent catalyst**? (not old news)
-- Is the narrative **under-discovered**? (not consensus)
-- Would a momentum trader call this **early**? (first leg, not third)
-- Palantir test: is this already widely known and re-rated?
+### Phase 1.5 — Intelligence Gathering
+- Yahoo Finance news headlines per candidate (asymmetric: used to disqualify, not qualify)
+- SPY-based market regime detection (bull/correction/mixed)
+- Market breadth (% of universe above 50 DMA)
 
-### Phase 3 — programmatic validation
-- Cross-checks LLM scores against quant data
-- Enforces minimum score thresholds and self-check booleans
-- Blacklist enforcement
-- Exports CSV, XLSX (multi-sheet), and detailed log file
+### Phase 2 — Two-Step LLM Analysis
+- **Step 1 (Research)**: Unstructured call with `web_search_preview`. No schema, so the model actually searches.
+- **Step 2 (Analysis)**: Structured call with Pydantic models, using Step 1's research as input.
+- Prompt calibration: burden of proof on approval (not rejection), macro vs. company-specific catalyst distinction, anchored scoring rubrics.
+
+### Phase 2.75 — Institutional Validation (NEW)
+- Uses **o3-mini** (reasoning model) with web search for each approved candidate
+- Checks analyst consensus, price targets, institutional ownership, valuation, earnings trajectory
+- Rejects stocks that are already consensus plays with limited upside
+- Only genuinely under-discovered opportunities proceed
+
+### Phase 2.5 — Devil's Advocate
+- Independent LLM call with **web search** that challenges every approved pick
+- Cross-checks catalyst claims against real headlines AND independent web research
+- Receives the full research log from Phase 2 (not an empty string)
+- Checks institutional consensus as part of its challenge
+
+### Phase 3 — Validation & Output
+- Programmatic cross-checks (scores, blacklist, overextension)
+- Devil's advocate integration (unverified catalysts get rejected)
+- Forward performance tracker (saves picks, checks returns on next run)
+- Export to CSV, XLSX (multi-sheet), and detailed per-run log file
+
+## Configuration
+
+All settings are in **`config.yaml`** at the project root. Key sections:
+
+```yaml
+llm:
+  research_model: "gpt-4o"          # Step 1: web research
+  analysis_model: "gpt-4o"          # Step 2: structured analysis
+  institutional_validation_model: "o3-mini"  # Phase 2.75: reasoning model
+  devils_advocate_model: "gpt-4o"   # Phase 2.5: skeptical check
+
+screener:
+  max_pct_from_52wk_high: 15.0      # Quantitative thresholds
+  min_relative_volume: 1.5
+  # ... all other thresholds
+
+validation:
+  min_institutional_validation_score: 6  # 1-10, institutional bar
+```
+
+See `config.yaml` for the full reference. If the file is missing, defaults are used.
 
 ## Quick Start
 
@@ -54,46 +100,64 @@ set PYTHONPATH=src        # Windows
 python -m stock_analyzer
 ```
 
-Results are saved to `results/` (CSV, XLSX, and a `.log` file per run).
+Results are saved to `results/` (CSV, XLSX, per-run `.log`).
+Pick tracking data is saved to `results/tracking/`.
+
+## Quality Evaluation
+
+After a run, evaluate the quality of approved picks:
+
+```bash
+python -m tests.quality.evaluate_picks results/screener_YYYYMMDD_HHMMSS.csv
+```
+
+This makes independent LLM calls with web search for each pick, replicating a professional investor's judgment. It outputs a per-stock comparison and an aggregate false-positive rate. Results are saved to `tests/quality/results/`.
 
 ## Project Structure
 
 ```
 src/stock_analyzer/
-├── config.py              # All tunable thresholds in one place
-├── pipeline.py            # Orchestrator (Phase 1 → 2 → 3)
-├── __main__.py            # Entry point with dual logging
-├── screener/              # Phase 1: quantitative
-│   ├── universe.py        # UniverseLoader (yfinance screener API)
-│   ├── market_data.py     # MarketDataFetcher (batch OHLCV download)
-│   ├── technical.py       # TechnicalCalculator (MAs, volume, breakout)
-│   └── quantitative_filter.py  # Hard numeric filters
-├── analyzer/              # Phase 2: qualitative
-│   ├── models.py          # Pydantic models (structured LLM output)
-│   ├── prompts.py         # System + user prompt templates
-│   ├── llm_analyzer.py    # LLMAnalyzer (batched OpenAI calls)
-│   └── validator.py       # Post-LLM validation layer
-└── export/                # Phase 3: output
-    └── report.py          # CSV, XLSX, console formatting
+├── config.py                   # Loads from config.yaml, exposes per-step LLM settings
+├── pipeline.py                 # Orchestrator (all phases including 2.75)
+├── __main__.py                 # Entry point with dual logging
+├── screener/                   # Phase 1: quantitative
+│   ├── universe.py             # UniverseLoader (triple-query yfinance screener)
+│   ├── market_data.py          # MarketDataFetcher (batch OHLCV download)
+│   ├── technical.py            # TechnicalCalculator (MAs, breakout, ATR, sector RS)
+│   ├── quantitative_filter.py  # Hard numeric filters
+│   └── news.py                 # NewsFetcher (yfinance headlines, asymmetric)
+├── analyzer/                   # Phase 2: qualitative
+│   ├── models.py               # Pydantic models (structured LLM output)
+│   ├── prompts.py              # Two-step prompt templates (research + analysis)
+│   ├── llm_analyzer.py         # LLMAnalyzer (two-step: research → analyze)
+│   ├── institutional_validator.py  # Phase 2.75: professional investor validation
+│   ├── devils_advocate.py      # Independent LLM cross-check (with web search)
+│   └── validator.py            # Post-LLM validation layer
+├── export/                     # Phase 3: output
+│   └── report.py               # CSV, XLSX, console formatting
+└── tracker/                    # Performance tracking
+    └── performance.py          # ForwardTracker (saves picks, checks returns)
+
+tests/quality/
+├── evaluate_picks.py           # Automated false-positive evaluation
+└── results/                    # Evaluation output (JSON)
+
+config.yaml                     # All settings (LLM models, thresholds, paths)
+docs/
+└── STRATEGY.md                 # Data strategy roadmap and improvement estimates
 ```
 
-## Configuration
+## Key Design Decisions
 
-All thresholds live in `src/stock_analyzer/config.py` → `ScreenerConfig`. Key parameters:
+1. **Two-step LLM**: separating "explore" from "judge" forces the model to actually search
+2. **Per-step model selection**: reasoning models (o3-mini) for judgment, cheaper models for data gathering
+3. **Institutional validation**: catches consensus plays that quantitative + basic LLM analysis miss
+4. **Inverted burden of proof**: approval requires positive evidence of early-stage, not just absence of negatives
+5. **Macro vs. alpha distinction**: sector-wide catalysts are scored differently from company-specific events
+6. **Devil's Advocate with web search**: independent verification, not just reasoning from provided data
+7. **Asymmetric news**: absence of coverage = positive (under-discovered), not negative
+8. **Sector-relative strength**: filters out stocks just riding sector ETF moves
+9. **Forward tracking**: the only way to know if system changes actually improve results
+10. **Quality evaluation**: automated false-positive detection replicating professional investor judgment
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `market_cap_min` | $500M | Minimum market cap |
-| `market_cap_max` | $25B | Maximum market cap |
-| `max_pct_from_52wk_high` | 8% | Must be within this % of 52-week high |
-| `min_relative_volume` | 1.5x | Minimum 3-day max relative volume |
-| `max_pct_above_breakout` | 30% | Maximum extension above breakout |
-| `min_avg_daily_dollar_volume` | $10M | Liquidity floor |
-
-## Design Principles
-
-1. **Quantitative data is real** — all numbers come from yfinance, not from LLM guesses
-2. **LLM only does what it's good at** — qualitative judgment, narrative assessment, catalyst research
-3. **Defense in depth** — even if the LLM approves a stock, programmatic validation can reject it
-4. **Batched LLM calls** — candidates are sent 4 at a time so the model actually searches per stock
-5. **Logging for investigation** — every run produces a detailed `.log` file in `results/`
+For the full data strategy and roadmap, see [docs/STRATEGY.md](docs/STRATEGY.md).

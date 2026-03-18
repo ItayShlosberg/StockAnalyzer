@@ -121,7 +121,11 @@ class ReportExporter:
                 print(f"\n  {i}. {c.ticker} — Conviction {c.conviction_score}/100")
                 print(f"     Cap: {cap_str}  |  Sector: {quant.get('sector', 'N/A')}  |  {quant.get('industry', 'N/A')}")
                 print(f"     Close: ${quant.get('last_close', 0):.2f}  |  Breakout: ${quant.get('breakout_level', 0)}  |  {quant.get('pct_above_breakout', 0):.1f}% above")
+                bo_tf = quant.get('breakout_timeframe', '')
+                bo_vr = quant.get('breakout_volume_ratio', 0)
+                srs = quant.get('sector_relative_strength', 0)
                 print(f"     Rel Vol (3d max): {quant.get('rel_volume_3d_max', 0):.1f}x  |  % from 52wk high: {quant.get('pct_from_52wk_high', 0):.1f}%")
+                print(f"     Breakout: {bo_tf}d high on {bo_vr:.1f}x vol  |  Sector RS: {srs:+.1f}%")
                 print(f"     Catalyst: {c.catalyst_summary[:140]}")
                 print(f"     Early-stage: {c.early_stage_reasoning[:140]}")
                 print(f"     Scores: timing={c.early_stage_timing_score} catalyst={c.catalyst_strength_score} "

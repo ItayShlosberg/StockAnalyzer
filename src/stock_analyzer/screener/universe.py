@@ -1,15 +1,22 @@
 """
 UniverseLoader — builds the initial stock universe via yfinance screener.
 
-Uses Yahoo Finance's EquityQuery API to pull all US-listed equities within
-the target market-cap and liquidity range.  Extracts metadata (market cap,
-sector, 52-week high) directly from the screener response to avoid slow
-per-ticker info calls.
+Runs three exhaustive screener queries with different sort criteria. Each
+query paginates until the API returns no more results, so the full set of
+matching US equities is captured. Multiple sorts provide redundancy in case
+the API silently caps pagination depth.
+
+1. Sort by percent change descending
+2. Sort by average daily volume descending
+3. Sort by market cap ascending
+
+Results are deduplicated and merged.
 """
 
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import yfinance as yf
@@ -28,11 +35,8 @@ class UniverseLoader:
 
     def load(self) -> tuple[list[str], pd.DataFrame]:
         """
-        Return (tickers, metadata_df).
-
-        metadata_df is indexed by ticker and contains market_cap, sector,
-        industry, fifty_two_week_high, fifty_two_week_low, short_name —
-        all extracted from the screener response (zero extra API calls).
+        Return (tickers, metadata_df) by exhaustively scanning all matching
+        US equities. Three sort orders run concurrently for speed.
         """
         query = EquityQuery("and", [
             EquityQuery("eq", ["region", "us"]),
@@ -41,22 +45,62 @@ class UniverseLoader:
             EquityQuery("gt", ["avgdailyvol3m", self._cfg.min_avg_volume_3m]),
         ])
 
+        scans = [
+            ("1/3", "percentchange", False),
+            ("2/3", "avgdailyvol3m", False),
+            ("3/3", "lastclosemarketcap.lasttwelvemonths", True),
+        ]
+
+        logger.info("Universe: launching %d parallel scans", len(scans))
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [
+                pool.submit(self._run_scan, query, label, sort_field, sort_asc)
+                for label, sort_field, sort_asc in scans
+            ]
+            scan_results = [f.result() for f in futures]
+
+        all_quotes: list[dict] = []
+        counts: list[int] = []
+        for quotes in scan_results:
+            all_quotes.extend(quotes)
+            counts.append(len(quotes))
+
+        tickers, metadata = self._process_quotes(all_quotes)
+        logger.info(
+            "Universe: %d raw quotes (%s) -> %d unique tickers after dedup/blacklist",
+            len(all_quotes), " + ".join(str(c) for c in counts), len(tickers),
+        )
+        return tickers, metadata
+
+    def _run_scan(
+        self, query: EquityQuery, label: str, sort_field: str, sort_asc: bool,
+    ) -> list[dict]:
+        """Run a single exhaustive scan (called from thread pool)."""
+        logger.info("Universe scan %s: sort by %s asc=%s (exhaustive)", label, sort_field, sort_asc)
+        return self._fetch_all_pages(query, sort_field, sort_asc=sort_asc)
+
+    def _fetch_all_pages(
+        self, query: EquityQuery, sort_field: str,
+        *, sort_asc: bool = False,
+    ) -> list[dict]:
+        """Paginate through ALL screener results until the API is exhausted."""
         all_quotes: list[dict] = []
         offset = 0
         page_size = self._cfg.universe_page_size
 
         while True:
-            logger.info("Fetching universe page offset=%d size=%d", offset, page_size)
+            logger.info("  Fetching page offset=%d size=%d sort=%s asc=%s", offset, page_size, sort_field, sort_asc)
             try:
                 response = yf.screen(
                     query,
-                    sortField="percentchange",
-                    sortAsc=False,
+                    sortField=sort_field,
+                    sortAsc=sort_asc,
                     size=page_size,
                     offset=offset,
                 )
             except Exception:
-                logger.exception("yfinance screen() failed at offset %d", offset)
+                logger.exception("  yfinance screen() failed at offset %d", offset)
                 break
 
             quotes = response.get("quotes", [])
@@ -67,20 +111,14 @@ class UniverseLoader:
 
             if len(quotes) < page_size:
                 break
-            if len(all_quotes) >= self._cfg.universe_max_tickers:
-                break
             offset += page_size
 
-        tickers, metadata = self._process_quotes(all_quotes)
-        logger.info(
-            "Universe: %d raw quotes -> %d tickers after dedup/blacklist",
-            len(all_quotes), len(tickers),
-        )
-        return tickers, metadata
+        logger.info("  %s: fetched %d quotes", sort_field, len(all_quotes))
+        return all_quotes
 
     @staticmethod
     def _process_quotes(quotes: list[dict]) -> tuple[list[str], pd.DataFrame]:
-        """Extract tickers and metadata from screener quote objects."""
+        """Extract tickers and metadata, deduplicating across queries."""
         seen: set[str] = set()
         rows: list[dict] = []
 

@@ -43,8 +43,9 @@ class QuantitativeFilter:
                 df["above_50dma"] == True,  # noqa: E712
             ),
             (
-                "Price > 200 DMA",
-                df["above_200dma"] == True,  # noqa: E712
+                "Price > 200 DMA or approaching from below",
+                (df["above_200dma"] == True)  # noqa: E712
+                | ((df["last_close"] / df["sma_200"] - 1) * 100 >= -self._cfg.max_pct_below_200dma),
             ),
             (
                 f"Within {self._cfg.max_pct_from_52wk_high}% of 52-week high",
@@ -66,7 +67,17 @@ class QuantitativeFilter:
                 f"Distance from breakout <= {self._cfg.max_pct_above_breakout}%",
                 df["pct_above_breakout"].fillna(999) <= self._cfg.max_pct_above_breakout,
             ),
+            (
+                "Sector-relative strength > 0 (outperforming sector)",
+                df["sector_relative_strength"] > 0,
+            ),
         ]
+
+        if "breakout_volume_ratio" in df.columns:
+            steps.append((
+                f"Breakout volume >= {self._cfg.min_breakout_volume_ratio}x avg",
+                df["breakout_volume_ratio"].fillna(0) >= self._cfg.min_breakout_volume_ratio,
+            ))
 
         for name, mask in steps:
             before = len(df)

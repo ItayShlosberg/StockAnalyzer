@@ -6,38 +6,76 @@ alwaysApply: false
 
 # StockAnalyzer Architecture
 
-## Three-phase pipeline
+## Pipeline Phases
 
 1. **Phase 1 — Quantitative Screening** (`screener/`): Pure Python + yfinance. No LLM.
-   - `UniverseLoader` → `MarketDataFetcher` → `TechnicalCalculator` → `QuantitativeFilter`
+   - `UniverseLoader` (exhaustive triple-query scan) → `MarketDataFetcher` → `TechnicalCalculator` → `QuantitativeFilter`
    - All numeric data is real. Never generate fake market data.
 
-2. **Phase 2 — Qualitative LLM Analysis** (`analyzer/`): OpenAI with web search.
-   - `LLMAnalyzer` sends candidates in batches of 4 with `web_search_preview` tool.
-   - LLM fills Pydantic models (`CandidateAnalysis`, `ScreenerLLMResult`).
-   - LLM must NOT override or invent quantitative data — it only judges qualitative aspects.
+2. **Phase 1.5 — Intelligence** (`screener/news.py` + pipeline):
+   - `fetch_news()` gets yfinance headlines per candidate (asymmetric: used to disqualify, not qualify).
+   - Market regime computed from SPY data.
 
-3. **Phase 3 — Validation & Export** (`analyzer/validator.py`, `export/`):
-   - Programmatic cross-checks on LLM output (scores, self-checks, blacklist).
-   - Export to CSV, XLSX, and per-run log file.
+3. **Phase 2 — Two-Step LLM Analysis** (`analyzer/`):
+   - **Step 1 (Research)**: `_step1_research()` — unstructured call with `web_search_preview`, NO schema.
+   - **Step 2 (Analysis)**: `_step2_analyze()` — structured call with Pydantic models, uses Step 1 output.
+   - Candidates processed in batches (configurable via `config.yaml` → `llm.batch_size`).
+   - `LLMAnalyzer.analyze()` returns `LLMAnalysisOutput` containing both the structured result and accumulated research log.
 
-## Key conventions
+4. **Phase 2.75 — Institutional Validation** (`analyzer/institutional_validator.py`): NEW
+   - `InstitutionalValidator` uses o3-mini (configurable) with `web_search_preview` tool.
+   - Checks analyst consensus, price targets, institutional ownership, valuation, earnings.
+   - Rejects stocks that are consensus plays. Only genuinely early-stage passes through.
+   - Threshold: `validation.min_institutional_validation_score` in config.yaml.
 
-- **Config in one place**: all thresholds in `config.py` → `ScreenerConfig` dataclass.
-- **Structured output**: always use Pydantic `BaseModel` for LLM responses. Use `Field(description=...)` on every field.
-- **No `.info` calls**: never use `yf.Ticker().info` — it is too slow. Extract metadata from `yf.screen()` response.
-- **Batch LLM calls**: never send all candidates in one LLM call. Batch by 3-4 so web search triggers per stock.
-- **Logging**: use `logging.getLogger(__name__)` in every module. DEBUG for detail, INFO for milestones.
-- **Classes with single responsibility**: each module has one main class. Pipeline orchestrates them.
+5. **Phase 2.5 — Devil's Advocate** (`analyzer/devils_advocate.py`):
+   - Independent LLM with `web_search_preview` tool that challenges approved picks.
+   - Receives the accumulated research log from Phase 2 (not empty string).
+   - Includes institutional consensus check in its challenge framework.
 
-## Adding new filters
+6. **Phase 3 — Validation & Export** (`analyzer/validator.py`, `export/`, `tracker/`):
+   - Programmatic checks: scores, blacklist, overextension, DA cross-reference.
+   - `ForwardTracker` saves picks and evaluates previous picks on each run.
 
-1. Add the threshold to `ScreenerConfig` in `config.py`.
-2. Implement the logic in `QuantitativeFilter.apply()` or `TechnicalCalculator.compute()`.
-3. The LLM prompt in `prompts.py` auto-includes all DataFrame columns — no manual sync needed.
+## Configuration
 
-## Adding new LLM fields
+- **YAML-first**: all settings in `config.yaml` at project root.
+- **Per-step model selection**: different pipeline steps use different LLM models (e.g. gpt-4o for research, o3-mini for judgment). Configured in `config.yaml` → `llm` section.
+- **`config.py`** loads from YAML, falls back to defaults. Exposes `LLMConfig`, `ScreenerConfig`, `ValidationConfig` dataclasses.
+- Consumers receive config via constructor injection (e.g. `LLMAnalyzer(llm_config)`, `InstitutionalValidator(llm_config)`).
 
-1. Add the field to `CandidateAnalysis` in `analyzer/models.py` with proper `Field(description=...)`.
-2. Update `SYSTEM_PROMPT` in `prompts.py` to instruct the model how to fill it.
-3. If it needs validation, add a check in `ResultValidator.validate()`.
+## Key Conventions
+
+- **Structured output**: Pydantic `BaseModel` for LLM responses. `Field(description=...)` on every field with scoring anchors.
+- **No `.info` calls**: never use `yf.Ticker().info` — too slow. Use screener metadata.
+- **Two-step LLM**: never combine web search + structured output in one call. Step 1 searches, Step 2 judges.
+- **Inverted burden of proof**: approval requires positive evidence of early-stage status. Rejection is the default.
+- **Macro vs. alpha**: sector-wide catalysts (oil, rates) scored <= 4, company-specific events scored >= 7.
+- **Asymmetric news**: absence of news = positive freshness signal, not a reason to reject.
+- **Logging**: `logging.getLogger(__name__)` in every module. DEBUG for detail, INFO for milestones.
+- **No circular self-checks**: validation uses the Devil's Advocate (independent LLM), not self-check booleans.
+
+## Adding New Filters
+
+1. Add threshold to `ScreenerConfig` in `config.py` AND `config.yaml`.
+2. Implement in `QuantitativeFilter.apply()` or `TechnicalCalculator.compute()`.
+3. New columns auto-appear in the LLM prompt (prompts.py reads all DataFrame columns).
+
+## Adding New LLM Fields
+
+1. Add to `CandidateAnalysis` in `analyzer/models.py` with `Field(description=...)` including scoring anchors.
+2. Update `ANALYSIS_SYSTEM_PROMPT` in `prompts.py`.
+3. If it needs validation, add check in `ResultValidator._check()`.
+
+## Adding New Data Sources
+
+1. Create a new fetcher in `screener/` (similar to `news.py`).
+2. Call it from `pipeline.py` between Phase 1 and Phase 2.
+3. Pass data to `build_analysis_prompt()` and `build_research_prompt()`.
+4. See `docs/STRATEGY.md` for the data source roadmap.
+
+## Quality Evaluation
+
+- `tests/quality/evaluate_picks.py`: standalone script to evaluate approved picks.
+- Run: `python -m tests.quality.evaluate_picks results/screener_YYYYMMDD.csv`
+- Outputs per-stock comparison and aggregate false-positive rate.

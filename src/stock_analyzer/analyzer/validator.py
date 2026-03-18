@@ -1,9 +1,9 @@
 """
 ResultValidator — programmatic post-LLM validation layer.
 
-Cross-checks the LLM's qualitative output against the real quantitative data
-and enforces score thresholds, self-check booleans, and blacklist rules.
-Even if the LLM approves a stock, the validator can reject it.
+Cross-checks the LLM's qualitative output against real quantitative data,
+enforces score thresholds and blacklist rules, and integrates the Devil's
+Advocate independent challenge results.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from stock_analyzer.analyzer.devils_advocate import ChallengeItem, DevilsAdvocateResult
 from stock_analyzer.analyzer.models import CandidateAnalysis, ScreenerLLMResult
 from stock_analyzer.config import MEGA_CAP_BLACKLIST, ScreenerConfig
 
@@ -26,10 +27,11 @@ class ValidationResult:
     passed: list[CandidateAnalysis] = field(default_factory=list)
     failed: list[dict] = field(default_factory=list)
     llm_result: ScreenerLLMResult | None = None
+    devils_advocate: DevilsAdvocateResult | None = None
 
 
 class ResultValidator:
-    """Validates LLM output against quant data and enforces hard rules."""
+    """Validates LLM output against quant data and devil's advocate challenges."""
 
     def __init__(self, config: ScreenerConfig) -> None:
         self._cfg = config
@@ -38,21 +40,22 @@ class ResultValidator:
         self,
         llm_result: ScreenerLLMResult,
         quant_df: pd.DataFrame,
+        da_result: DevilsAdvocateResult | None = None,
     ) -> ValidationResult:
         """
-        Run every approved candidate through validation checks.
-
-        Args:
-            llm_result: The parsed LLM response.
-            quant_df: The Phase 1 quantitative DataFrame (indexed by ticker).
-
-        Returns:
-            ValidationResult with passed/failed lists.
+        Run every approved candidate through validation checks including
+        the devil's advocate cross-reference.
         """
-        vr = ValidationResult(llm_result=llm_result)
+        vr = ValidationResult(llm_result=llm_result, devils_advocate=da_result)
+
+        da_by_ticker: dict[str, ChallengeItem] = {}
+        if da_result:
+            for ch in da_result.challenges:
+                da_by_ticker[ch.ticker.upper()] = ch
 
         for candidate in llm_result.analyzed_candidates:
-            violations = self._check(candidate, quant_df)
+            challenge = da_by_ticker.get(candidate.ticker.upper())
+            violations = self._check(candidate, quant_df, challenge)
             if violations:
                 vr.failed.append({
                     "ticker": candidate.ticker,
@@ -71,19 +74,15 @@ class ResultValidator:
         return vr
 
     def _check(
-        self, c: CandidateAnalysis, quant_df: pd.DataFrame,
+        self,
+        c: CandidateAnalysis,
+        quant_df: pd.DataFrame,
+        challenge: ChallengeItem | None,
     ) -> list[str]:
         violations: list[str] = []
 
         if c.ticker.upper() in MEGA_CAP_BLACKLIST:
             violations.append(f"BLACKLISTED: {c.ticker} is a known crowd favorite")
-
-        if c.self_check_already_obvious:
-            violations.append("SELF-CHECK: LLM flagged as already obvious")
-        if c.self_check_palantir_test:
-            violations.append("PALANTIR TEST: shares traits with late-stage names")
-        if c.self_check_on_mainstream_lists:
-            violations.append("MAINSTREAM: would appear on popular momentum lists")
 
         if c.early_stage_timing_score < self._cfg.min_early_stage_timing_score:
             violations.append(
@@ -106,6 +105,17 @@ class ResultValidator:
                 violations.append(
                     f"OVEREXTENDED (quant): {pct_above:.1f}% above breakout "
                     f"(max {self._cfg.max_pct_above_breakout}%)",
+                )
+
+        if challenge:
+            if not challenge.catalyst_verified:
+                violations.append(
+                    "DA: Catalyst NOT VERIFIED — claimed catalyst not found in news or research"
+                )
+            if challenge.reject_recommendation and c.conviction_score < 80:
+                violations.append(
+                    f"DA: Rejection recommended (confidence {challenge.confidence}/10): "
+                    f"{challenge.strongest_bear_case[:80]}"
                 )
 
         return violations
